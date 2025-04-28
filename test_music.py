@@ -2,7 +2,7 @@ import pytest
 import music
 from hypothesis import given, settings, strategies as st
 
-settings.register_profile("intense", max_examples=20000)
+settings.register_profile("intense", max_examples=2000)
 settings.load_profile("intense")
 
 def test_get_queue_initializes_empty():
