@@ -1,4 +1,4 @@
-# bonebot.py
+# bonebot.py — YouTube + SoundCloud + Spotify (tuple queue preserved)
 import os
 import re
 import asyncio
@@ -9,8 +9,13 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 import yt_dlp
-import time
-from dataclasses import dataclass
+
+# Optional Spotify support
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+except Exception:
+    spotipy = None  # handled gracefully below
 
 # -------------------------------------------------------------
 # Load environment variables
@@ -40,23 +45,27 @@ voice_clients: dict[int, discord.VoiceClient] = {}# guild_id -> VoiceClient
 last_activity: dict[int, datetime] = {}           # guild_id -> datetime
 playlist_processing_status: dict[int, bool] = {}  # guild_id -> bool
 
-track_cache = {}  # {guild_id: {'now': Track|None, 'next': Track|None}}
+# -------------------------------------------------------------
+# URL matchers / helpers
+# -------------------------------------------------------------
+YOUTUBE_RE = re.compile(r'^(https?://)?(www\.)?(youtube\.com|youtu\.?be)/.+$', re.I)
+SOUNDCLOUD_RE = re.compile(r'(?:https?://)?(?:www\.)?soundcloud\.com/\S+', re.I)
 
-@dataclass
-class Track:
-    title: str
-    webpage_url: str
-    stream_url: str | None = None
-    stream_resolved_at: float | None = None  # epoch seconds
+SPOTIFY_TRACK_RE = re.compile(r'open\.spotify\.com/(?:intl-[a-z]{2}/)?track/([A-Za-z0-9]+)', re.I)
+SPOTIFY_PLAYLIST_RE = re.compile(r'open\.spotify\.com/(?:intl-[a-z]{2}/)?playlist/([A-Za-z0-9]+)', re.I)
+SPOTIFY_ALBUM_RE = re.compile(r'open\.spotify\.com/(?:intl-[a-z]{2}/)?album/([A-Za-z0-9]+)', re.I)
 
-def _get_cache(guild_id: int):
-    if guild_id not in track_cache:
-        track_cache[guild_id] = {'now': None, 'next': None}
-    return track_cache[guild_id]
+def is_youtube_url(s: str) -> bool:
+    return bool(YOUTUBE_RE.match(s))
 
+def is_soundcloud_url(s: str) -> bool:
+    return bool(SOUNDCLOUD_RE.search(s))
+
+def is_spotify_url(s: str) -> bool:
+    return 'open.spotify.com' in s
 
 # -------------------------------------------------------------
-# YTDL options & instances
+# yt-dlp options & instances
 # -------------------------------------------------------------
 yt_dl_options = {
     # Prefer already-opus sources when possible; fall back to bestaudio.
@@ -68,6 +77,7 @@ yt_dl_options = {
     'no_warnings': True,
     'extract_flat': 'in_playlist',  # fast playlist enumeration
 }
+
 ytdl = yt_dlp.YoutubeDL(yt_dl_options)
 
 # Optional chunked playlist configs (used by process_remaining_playlist)
@@ -139,7 +149,6 @@ from_three_hundred_on = {
 }
 
 # YTDL instances
-ytdl = yt_dlp.YoutubeDL(yt_dl_options)
 opt1 = yt_dlp.YoutubeDL(first_ten)
 opt2 = yt_dlp.YoutubeDL(eleventofifty)
 opt3 = yt_dlp.YoutubeDL(fifty_one_to_one_hundred)
@@ -158,7 +167,6 @@ ffmpeg_options = {
     ),
     'options': '-vn -filter:a "volume=0.25"'
 }
-
 
 # -------------------------------------------------------------
 # Background idle disconnect task
@@ -205,14 +213,26 @@ def cleanup_guild_state(guild_id: int):
     last_activity[guild_id] = datetime.now()
 
 async def fetch_stream_url(url: str) -> str:
-    """Extract a direct audio URL via yt-dlp off the event loop."""
+    """Extract a direct audio URL via yt-dlp off the event loop. Robust for SoundCloud/HLS."""
     loop = asyncio.get_running_loop()
     def _extract():
         return ytdl.extract_info(url, download=False)
     data = await loop.run_in_executor(None, _extract)
-    if "url" not in data:
-        raise Exception("No stream URL found from extractor.")
-    return data["url"]
+    if not data:
+        raise Exception("Extractor returned no data.")
+
+    # Prefer top-level url if present
+    if data.get("url"):
+        return data["url"]
+
+    # Fallback to requested_formats/formats (common on SoundCloud/HLS)
+    fmts = data.get("requested_formats") or data.get("formats") or []
+    for f in fmts:
+        u = f.get("url")
+        if u:
+            return u
+
+    raise Exception("No stream URL found from extractor.")
 
 async def retry_with_backoff(func, *args, retries=5, initial_delay=2):
     delay = initial_delay
@@ -247,6 +267,99 @@ async def connect_with_voice_reset(channel: discord.VoiceChannel, guild_id: int)
             await asyncio.sleep(1)
             return await channel.connect(reconnect=False)
         raise
+
+# ---- Spotify helpers -------------------------------------------------------
+def _clean_title(s: str) -> str:
+    # Remove bracketed fluff like (Remastered 2011), [Official Video], etc.
+    return re.sub(r'\s*[\(\[\{].*?[\)\]\}]', '', s).strip()
+
+def _get_spotify_client():
+    if spotipy is None:
+        return None, "Spotify support not installed. Run: pip install spotipy"
+    cid = os.getenv("SPOTIFY_CLIENT_ID")
+    sec = os.getenv("SPOTIFY_CLIENT_SECRET")
+    if not cid or not sec:
+        return None, "Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your environment (.env)."
+    auth = SpotifyClientCredentials(client_id=cid, client_secret=sec)
+    return spotipy.Spotify(auth_manager=auth), None
+
+async def _yt_search_watch_url(query: str) -> tuple[str, str]:
+    """Return (title, watch_url) for the best YouTube match."""
+    loop = asyncio.get_running_loop()
+    ytdl_single = yt_dlp.YoutubeDL({**yt_dl_options, "noplaylist": True})
+    data = await loop.run_in_executor(None, lambda: ytdl_single.extract_info(f"ytsearch1:{query}", download=False))
+    if not data or not data.get("entries"):
+        raise RuntimeError(f"No YouTube results for: {query}")
+    e = data["entries"][0]
+    title = e.get("title") or query
+    watch_url = e.get("webpage_url") or (f"https://www.youtube.com/watch?v={e.get('id')}" if e.get("id") else None)
+    if not watch_url:
+        raise RuntimeError("Could not resolve a YouTube watch URL.")
+    return title, watch_url
+
+async def _enqueue_spotify_track(interaction: discord.Interaction, sp, track_id: str):
+    guild_id = interaction.guild_id
+    loop = asyncio.get_running_loop()
+    tr = await loop.run_in_executor(None, lambda: sp.track(track_id))
+    if not tr:
+        raise RuntimeError("Spotify track not found.")
+    name = _clean_title(tr.get("name", ""))
+    artists = ", ".join(a.get("name") for a in tr.get("artists", []) if a and a.get("name"))
+    query = f"{artists} - {name}" if artists else name
+    yt_title, yt_watch = await _yt_search_watch_url(query)
+    queues.setdefault(guild_id, []).append((yt_title, yt_watch))
+    await interaction.followup.send(f"Added to queue: {artists} – {name} (via Spotify)")
+
+async def _collect_spotify_items(sp, kind: str, obj_id: str) -> list[tuple[str, str]]:
+    """Collect (track_name, artist_names) pairs for a playlist/album."""
+    items: list[tuple[str, str]] = []
+    if kind == "playlist":
+        results = sp.playlist_items(obj_id, additional_types=('track',), limit=100)
+        while results:
+            for item in results.get('items', []):
+                tr = (item or {}).get('track') or {}
+                if tr and tr.get('name'):
+                    name = tr['name']
+                    artists = ", ".join(a.get("name") for a in tr.get("artists", []) if a and a.get("name"))
+                    items.append((name, artists))
+            results = sp.next(results) if results.get('next') else None
+    elif kind == "album":
+        album = sp.album(obj_id)
+        album_artists = ", ".join(a.get("name") for a in album.get("artists", []) if a and a.get("name"))
+        results = sp.album_tracks(obj_id, limit=50)
+        while results:
+            for tr in results.get('items', []):
+                if tr and tr.get('name'):
+                    name = tr['name']
+                    artists = ", ".join(a.get("name") for a in tr.get('artists', [])) or album_artists
+                    items.append((name, artists))
+            results = sp.next(results) if results.get('next') else None
+    return items
+
+async def _process_spotify_collection(interaction: discord.Interaction, sp, kind: str, obj_id: str, skip_first: int = 1):
+    guild_id = interaction.guild_id
+    loop = asyncio.get_running_loop()
+
+    def _collect():
+        return _collect_spotify_items(sp, kind, obj_id)
+
+    meta_list = await loop.run_in_executor(None, _collect)
+    meta_list = meta_list[skip_first:] if skip_first else meta_list
+
+    added = 0
+    for name, artists in meta_list:
+        query = f"{artists} - {_clean_title(name)}" if artists else _clean_title(name)
+        try:
+            yt_title, yt_watch = await _yt_search_watch_url(query)
+            queues.setdefault(guild_id, []).append((yt_title, yt_watch))
+            added += 1
+        except Exception as e:
+            print(f"[spotify] Failed to map '{query}': {e}")
+
+    if added:
+        await interaction.followup.send(f"Queued {added} more from Spotify {kind}.")
+    else:
+        await interaction.followup.send(f"No additional playable items found in this Spotify {kind}.")
 
 # -------------------------------------------------------------
 # Playback pipeline
@@ -288,8 +401,8 @@ async def play_next(interaction: discord.Interaction):
 # -------------------------------------------------------------
 # Slash Commands
 # -------------------------------------------------------------
-@bot.tree.command(name="play", description="Play a song from YouTube")
-@app_commands.describe(query="Song name or YouTube URL")
+@bot.tree.command(name="play", description="Play a song from YouTube / SoundCloud / Spotify")
+@app_commands.describe(query="Song name or URL (YouTube, SoundCloud, Spotify)")
 async def play_cmd(interaction: discord.Interaction, query: str):
     guild_id = interaction.guild_id
     last_activity[guild_id] = datetime.now()
@@ -302,30 +415,84 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         await interaction.response.defer(thinking=True)
 
     # ---------- Resolve the first item BEFORE connecting to voice ----------
-    # Use yt-dlp's ytsearch1 to avoid blocking HTML scraping
-    if not re.match(r"^(https?://)?(www\.)?(youtube\.com|youtu\.?be)/.+$", query):
-        source = f"ytsearch1:{query}"
+    queued_any = False
+
+    # Spotify links → map to YouTube and queue
+    if is_spotify_url(query):
+        sp, err = _get_spotify_client()
+        if not sp:
+            await interaction.followup.send(err)
+            return
+
+        m = SPOTIFY_TRACK_RE.search(query)
+        if m:
+            await _enqueue_spotify_track(interaction, sp, m.group(1))
+            queued_any = True
+        else:
+            m_pl = SPOTIFY_PLAYLIST_RE.search(query)
+            m_al = SPOTIFY_ALBUM_RE.search(query)
+            if m_pl or m_al:
+                kind = "playlist" if m_pl else "album"
+                obj_id = (m_pl or m_al).group(1)
+
+                # Pull the collection meta and queue the FIRST track immediately
+                loop = asyncio.get_running_loop()
+                def _first():
+                    items = _collect_spotify_items(sp, kind, obj_id)
+                    return items[0] if items else None
+
+                first = await loop.run_in_executor(None, _first)
+                if not first:
+                    await interaction.followup.send(f"No playable items found in that Spotify {kind}.")
+                    return
+
+                name, artists = first
+                query_first = f"{artists} - {_clean_title(name)}" if artists else _clean_title(name)
+                yt_title, yt_watch = await _yt_search_watch_url(query_first)
+                queues.setdefault(guild_id, []).append((yt_title, yt_watch))
+                await interaction.followup.send(f"Added to queue: {artists} – {name} (via Spotify)")
+                queued_any = True
+
+                # Fetch the rest in the background
+                asyncio.create_task(_process_spotify_collection(interaction, sp, kind, obj_id, skip_first=1))
+            else:
+                await interaction.followup.send("Unsupported Spotify URL.")
+                return
+
+    # SoundCloud links → feed straight to yt-dlp later (we only grab a title for UX)
+    elif is_soundcloud_url(query):
+        loop = asyncio.get_running_loop()
+        try:
+            # Get a nice title, but keep the URL as the SoundCloud page
+            meta = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
+            title = meta.get("title") or "SoundCloud track"
+        except Exception:
+            title = "SoundCloud track"
+        queues.setdefault(guild_id, []).append((title, query))
+        await interaction.followup.send(f"Added to queue: {title} (SoundCloud)")
+        queued_any = True
+
+    # YouTube link or plain search → original behavior
     else:
-        source = query
+        source = query if is_youtube_url(query) else f"ytsearch1:{query}"
+        ytdl_single = yt_dlp.YoutubeDL({**yt_dl_options, "noplaylist": True})
+        loop = asyncio.get_running_loop()
+        try:
+            first_video = await loop.run_in_executor(
+                None, lambda: ytdl_single.extract_info(source, download=False)
+            )
+            if 'entries' in first_video:
+                first_video = first_video['entries'][0]
+        except Exception as e:
+            await interaction.followup.send(f"Search/extract failed: {e}")
+            return
 
-    ytdl_single = yt_dlp.YoutubeDL({**yt_dl_options, "noplaylist": True})
-    loop = asyncio.get_running_loop()
-    try:
-        first_video = await loop.run_in_executor(
-            None, lambda: ytdl_single.extract_info(source, download=False)
-        )
-        if 'entries' in first_video:
-            first_video = first_video['entries'][0]
-    except Exception as e:
-        await interaction.followup.send(f"Search/extract failed: {e}", ephemeral=True)
-        return
+        queues.setdefault(guild_id, []).append((first_video["title"], first_video.get("webpage_url") or first_video.get("url")))
+        await interaction.followup.send(f"Added to queue: {first_video['title']}")
+        queued_any = True
 
-    # Queue it
-    queues.setdefault(guild_id, []).append((first_video["title"], first_video["url"]))
-    await interaction.followup.send(f"Added to queue: {first_video['title']}")
-
-    # Kick off any playlist processing in the background if a playlist link was provided
-    if "list=" in query:
+    # ---------- Playlist expansion for native YouTube only ----------
+    if queued_any and "list=" in query and is_youtube_url(query):
         await interaction.followup.send("Playlist detected. Fetching more songs...")
         asyncio.create_task(process_remaining_playlist(interaction, query))
 
@@ -442,33 +609,6 @@ async def process_remaining_playlist(interaction: discord.Interaction, link: str
             await interaction.followup.send("No additional tracks found in the playlist.")
     finally:
         playlist_processing_status[guild_id] = False
-
-YTDL_URL_TTL = 60 * 60 * 4  # 4 hours is safe for YT signed URLs
-
-async def resolve_stream_url(webpage_url: str) -> str:
-    loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(webpage_url, download=False))
-    if data is None:
-        raise RuntimeError("yt-dlp returned no data")
-    # For ytsearch1 we get a 'entries' list; normalize to a playable video
-    if 'entries' in data:
-        data = data['entries'][0]
-    if "url" not in data:
-        # Some extractors put the direct URL in 'url' after 'requested_formats'
-        if 'requested_formats' in data and data['requested_formats']:
-            data_url = data['requested_formats'][0].get('url')
-            if data_url:
-                return data_url
-        raise RuntimeError("No stream URL found.")
-    return data["url"]
-
-async def ensure_stream(track: Track) -> Track:
-    if track.stream_url and track.stream_resolved_at and (time.time() - track.stream_resolved_at) < YTDL_URL_TTL:
-        return track
-    stream = await resolve_stream_url(track.webpage_url)
-    track.stream_url = stream
-    track.stream_resolved_at = time.time()
-    return track
 
 # -------------------------------------------------------------
 # Run
