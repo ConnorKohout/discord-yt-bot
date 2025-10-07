@@ -9,8 +9,6 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 import yt_dlp
-import time
-from dataclasses import dataclass
 
 # -------------------------------------------------------------
 # Load environment variables
@@ -40,35 +38,22 @@ voice_clients: dict[int, discord.VoiceClient] = {}# guild_id -> VoiceClient
 last_activity: dict[int, datetime] = {}           # guild_id -> datetime
 playlist_processing_status: dict[int, bool] = {}  # guild_id -> bool
 
-track_cache = {}  # {guild_id: {'now': Track|None, 'next': Track|None}}
-
-@dataclass
-class Track:
-    title: str
-    webpage_url: str
-    stream_url: str | None = None
-    stream_resolved_at: float | None = None  # epoch seconds
-
-def _get_cache(guild_id: int):
-    if guild_id not in track_cache:
-        track_cache[guild_id] = {'now': None, 'next': None}
-    return track_cache[guild_id]
-
-
 # -------------------------------------------------------------
 # YTDL options & instances
 # -------------------------------------------------------------
 yt_dl_options = {
-    # Prefer already-opus sources when possible; fall back to bestaudio.
-    'format': 'bestaudio[acodec=opus]/bestaudio/best',
-    'default_search': 'ytsearch',
+    'format': 'm4a/bestaudio/best',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'm4a',
+        'preferredquality': '140',
+    }],
+    'default_search': 'auto',
     'noplaylist': False,
     'ignoreerrors': True,
-    'quiet': True,
-    'no_warnings': True,
-    'extract_flat': 'in_playlist',  # fast playlist enumeration
+    'flat_playlist': True,  # metadata only, faster
+    'verbose': True
 }
-ytdl = yt_dlp.YoutubeDL(yt_dl_options)
 
 # Optional chunked playlist configs (used by process_remaining_playlist)
 first_ten = {
@@ -149,16 +134,9 @@ opt6 = yt_dlp.YoutubeDL(from_three_hundred_on)
 
 # FFMPEG options
 ffmpeg_options = {
-    'before_options': (
-        '-nostdin '
-        '-hide_banner -loglevel warning '
-        '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
-        '-rw_timeout 15000000 '           # 15s I/O timeout
-        '-analyzeduration 0 -probesize 32k'  # fast start
-    ),
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn -filter:a "volume=0.25"'
 }
-
 
 # -------------------------------------------------------------
 # Background idle disconnect task
@@ -442,33 +420,6 @@ async def process_remaining_playlist(interaction: discord.Interaction, link: str
             await interaction.followup.send("No additional tracks found in the playlist.")
     finally:
         playlist_processing_status[guild_id] = False
-
-YTDL_URL_TTL = 60 * 60 * 4  # 4 hours is safe for YT signed URLs
-
-async def resolve_stream_url(webpage_url: str) -> str:
-    loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(webpage_url, download=False))
-    if data is None:
-        raise RuntimeError("yt-dlp returned no data")
-    # For ytsearch1 we get a 'entries' list; normalize to a playable video
-    if 'entries' in data:
-        data = data['entries'][0]
-    if "url" not in data:
-        # Some extractors put the direct URL in 'url' after 'requested_formats'
-        if 'requested_formats' in data and data['requested_formats']:
-            data_url = data['requested_formats'][0].get('url')
-            if data_url:
-                return data_url
-        raise RuntimeError("No stream URL found.")
-    return data["url"]
-
-async def ensure_stream(track: Track) -> Track:
-    if track.stream_url and track.stream_resolved_at and (time.time() - track.stream_resolved_at) < YTDL_URL_TTL:
-        return track
-    stream = await resolve_stream_url(track.webpage_url)
-    track.stream_url = stream
-    track.stream_resolved_at = time.time()
-    return track
 
 # -------------------------------------------------------------
 # Run
