@@ -35,6 +35,8 @@ intents.message_content = bool(os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "0") =
 intents.guilds = True
 intents.voice_states = True
 
+bot = commands.Bot(command_prefix="!", intents=intents)
+
 # -------------------------------------------------------------
 # Global State
 # -------------------------------------------------------------
