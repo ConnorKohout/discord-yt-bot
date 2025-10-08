@@ -35,8 +35,6 @@ intents.message_content = bool(os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "0") =
 intents.guilds = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-
 # -------------------------------------------------------------
 # Global State
 # -------------------------------------------------------------
@@ -310,7 +308,7 @@ async def _enqueue_spotify_track(interaction: discord.Interaction, sp, track_id:
     queues.setdefault(guild_id, []).append((yt_title, yt_watch))
     await interaction.followup.send(f"Added to queue: {artists} – {name} (via Spotify)")
 
-async def _collect_spotify_items(sp, kind: str, obj_id: str) -> list[tuple[str, str]]:
+def _collect_spotify_items(sp, kind: str, obj_id: str) -> list[tuple[str, str]]:
     """Collect (track_name, artist_names) pairs for a playlist/album."""
     items: list[tuple[str, str]] = []
     if kind == "playlist":
@@ -344,6 +342,8 @@ async def _process_spotify_collection(interaction: discord.Interaction, sp, kind
         return _collect_spotify_items(sp, kind, obj_id)
 
     meta_list = await loop.run_in_executor(None, _collect)
+    if skip_first:
+        meta_list = meta_list[skip_first:]
     meta_list = meta_list[skip_first:] if skip_first else meta_list
 
     added = 0
@@ -556,19 +556,19 @@ async def stop_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("Stopped and disconnected.")
 
 # Diagnostic command retained (optional)
-@bot.tree.command(name="pingvc", description="Test voice connect: join your voice and leave after 2s.")
-async def pingvc_cmd(interaction: discord.Interaction):
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        vc = await interaction.user.voice.channel.connect(reconnect=True)
-        await interaction.followup.send("Connected. Leaving in 2s…")
-        await asyncio.sleep(2)
-        await vc.disconnect()
-    except Exception as e:
-        await interaction.followup.send(f"Failed: {e}")
+#@bot.tree.command(name="pingvc", description="Test voice connect: join your voice and leave after 2s.")
+#async def pingvc_cmd(interaction: discord.Interaction):
+#    if not interaction.user.voice or not interaction.user.voice.channel:
+#        await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
+#        return
+#    await interaction.response.defer(ephemeral=True)
+#    try:
+#        vc = await interaction.user.voice.channel.connect(reconnect=True)
+#        await interaction.followup.send("Connected. Leaving in 2s…")
+#        await asyncio.sleep(2)
+#        await vc.disconnect()
+#    except Exception as e:
+#        await interaction.followup.send(f"Failed: {e}")
 
 # -------------------------------------------------------------
 # Playlist processing (optional / background)
